@@ -7,6 +7,7 @@
 #   3. 降采样: 固定桶大小时间窗口聚合 (LTTB 风格桶聚合)
 #   4. 自动路由: 大时间跨度查询命中小时级预聚合表
 #   5. 异常点检测: 基于滑动窗口 Z-Score
+#   6. 异常事件聚类: 按时间接近度+实例关联性将异常点聚合为故障事件
 # =============================================================
 import math
 import os
@@ -303,6 +304,25 @@ def latest_points(
 # ---------------------------------------------------------------
 # API: 异常点检测 (滑动窗口 Z-Score)
 # ---------------------------------------------------------------
+def _zscore_anomalies(rows: list[dict], window: int, threshold: float) -> list[dict]:
+    """对单条时间序列做滑动窗口 Z-Score 异常点检测。
+    rows 需按 ts 升序, 每项含 ts(毫秒) 与 value。"""
+    anomalies = []
+    values = [r["value"] for r in rows]
+    for i, r in enumerate(rows):
+        if i < window:
+            continue
+        w = values[i - window:i]
+        mean = sum(w) / window
+        var = sum((x - mean) ** 2 for x in w) / window
+        std = math.sqrt(var) if var > 0 else 0
+        if std > 0:
+            z = abs(r["value"] - mean) / std
+            if z > threshold:
+                anomalies.append({"ts": int(r["ts"]), "value": r["value"], "zscore": round(z, 2)})
+    return anomalies
+
+
 @app.get("/api/anomalies")
 def detect_anomalies(
     metric: str = Query(...),
@@ -330,21 +350,144 @@ def detect_anomalies(
             (*mids, start_dt, end_dt),
         )
         rows = cur.fetchall()
+    return {"anomalies": _zscore_anomalies(rows, window, threshold)}
 
-    anomalies = []
-    values = [r["value"] for r in rows]
-    for i, r in enumerate(rows):
-        if i < window:
-            continue
-        w = values[i - window:i]
-        mean = sum(w) / window
-        var = sum((x - mean) ** 2 for x in w) / window
-        std = math.sqrt(var) if var > 0 else 0
-        if std > 0:
-            z = abs(r["value"] - mean) / std
-            if z > threshold:
-                anomalies.append({"ts": int(r["ts"]), "value": r["value"], "zscore": round(z, 2)})
-    return {"anomalies": anomalies}
+
+# ---------------------------------------------------------------
+# API: 异常事件聚类
+#   将分散的异常点按"时间接近度 + 实例关联性"聚合为异常事件。
+#   每个事件代表一次完整故障过程: 起止时间 / 涉及指标 / 影响范围(实例)。
+#
+#   并发说明: 异常点列表与新数据写入并发。本接口不做任何结果缓存,
+#   每次请求在同一个数据库事务快照(REPEATABLE READ)内完成取数、
+#   检测与聚类, 聚类过程为纯内存计算、无共享可变状态; 边界异常点
+#   随新数据流入变化时, 下一次请求自然得到新的事件分组结果。
+# ---------------------------------------------------------------
+def _median_sampling_interval(rows: list[dict]) -> Optional[float]:
+    """估计单条序列的采样间隔中位数(秒), 用于自适应聚类粒度。"""
+    ts = [r["ts"] for r in rows]
+    diffs = sorted(ts[i + 1] - ts[i] for i in range(len(ts) - 1) if ts[i + 1] > ts[i])
+    if not diffs:
+        return None
+    return diffs[len(diffs) // 2] / 1000.0
+
+
+def _cluster_anomaly_events(points: list[dict], gap_same: float, gap_cross: float) -> list[dict]:
+    """单链聚类: 按时间排序后, 与当前事件内"同实例最近点"间隔 <= gap_same
+    或"跨实例最近点"间隔 <= gap_cross 时并入当前事件, 否则开启新事件。
+    同实例阈值更宽松(同一故障的连锁异常多发生在同实例上),
+    跨实例要求时间上更紧密才视为同一故障。"""
+    events: list[list[dict]] = []
+    last_by_instance: dict[str, dict] = {}
+    last_any: Optional[dict] = None
+    for p in sorted(points, key=lambda x: x["ts"]):
+        linked = False
+        if events:
+            same = last_by_instance.get(p["instance"])
+            if same is not None and (p["ts"] - same["ts"]) / 1000.0 <= gap_same:
+                linked = True
+            elif (last_any is not None and last_any is not same
+                  and (p["ts"] - last_any["ts"]) / 1000.0 <= gap_cross):
+                linked = True
+        if not linked:
+            events.append([])
+            last_by_instance = {}
+        events[-1].append(p)
+        last_by_instance[p["instance"]] = p
+        last_any = p
+
+    result = []
+    for i, pts in enumerate(events, 1):
+        result.append({
+            "id": f"evt-{i}",
+            "start_ts": pts[0]["ts"],
+            "end_ts": pts[-1]["ts"],
+            "duration_sec": round((pts[-1]["ts"] - pts[0]["ts"]) / 1000.0, 3),
+            "metrics": sorted({p["metric"] for p in pts}),
+            "instances": sorted({p["instance"] for p in pts}),
+            "point_count": len(pts),
+            "max_zscore": max(p["zscore"] for p in pts),
+        })
+    return result
+
+
+@app.get("/api/anomaly-events")
+def anomaly_events(
+    start: float = Query(..., description="起始Unix时间戳(秒)"),
+    end: float = Query(..., description="结束Unix时间戳(秒)"),
+    metrics: str = Query("", description="逗号分隔指标名, 缺省为全部指标"),
+    instance: str = Query("", description="实例过滤, 缺省全部实例"),
+    window: int = Query(20, description="滑动窗口大小(点数)"),
+    threshold: float = Query(3.0, description="Z-Score阈值"),
+    gap: Optional[float] = Query(None, description="同实例聚类间隔阈值(秒), 缺省按采样间隔自适应"),
+    gap_factor: float = Query(15.0, description="自适应间隔 = 采样间隔中位数 × 该系数"),
+):
+    """
+    异常事件聚类:
+      1. 依赖异常检测模块: 对范围内每条序列执行滑动窗口 Z-Score 检测;
+      2. 与指标元数据模块交互: 从 metrics 元数据表解析指标/实例集合;
+      3. 聚类粒度动态调整: 间隔阈值 = 采样间隔中位数 × gap_factor
+         (限制在 [30s, 1800s]), 稀疏异常不会被合并, 同一故障的连锁异常
+         通过单链传递被正确关联;
+      4. 指定范围内无异常点时返回空事件列表。
+    """
+    start_dt = datetime.fromtimestamp(start)
+    end_dt = datetime.fromtimestamp(end)
+    names = [m.strip() for m in metrics.split(",") if m.strip()]
+
+    anomaly_points: list[dict] = []
+    intervals: list[float] = []
+    # 单事务快照内完成全部读取, 保证并发写入下聚类输入的一致性
+    with pool.acquire() as conn, conn.cursor() as cur:
+        sql = "SELECT id, name, instance FROM metrics"
+        conds, params = [], []
+        if instance:
+            conds.append("instance=%s")
+            params.append(instance)
+        if names:
+            conds.append(f"name IN ({','.join(['%s'] * len(names))})")
+            params.extend(names)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        cur.execute(sql, params)
+        meta_rows = cur.fetchall()
+
+        for m in meta_rows:
+            cur.execute(
+                "SELECT UNIX_TIMESTAMP(ts)*1000 AS ts, value FROM metric_data "
+                "WHERE metric_id=%s AND ts >= %s AND ts < %s ORDER BY ts",
+                (m["id"], start_dt, end_dt),
+            )
+            rows = cur.fetchall()
+            iv = _median_sampling_interval(rows)
+            if iv is not None:
+                intervals.append(iv)
+            for a in _zscore_anomalies(rows, window, threshold):
+                anomaly_points.append({
+                    **a, "metric": m["name"], "instance": m["instance"],
+                })
+
+    # 范围内不存在任何异常点 => 无异常事件可返回
+    if not anomaly_points:
+        return {"events": [], "anomaly_points": 0, "gap_seconds": None}
+
+    # 动态聚类粒度: 由数据采样密度推导, 而非固定常量
+    if gap is not None:
+        gap_same = gap
+    elif intervals:
+        intervals.sort()
+        gap_same = intervals[len(intervals) // 2] * gap_factor
+    else:
+        gap_same = 300.0
+    gap_same = min(max(gap_same, 30.0), 1800.0)
+    gap_cross = gap_same / 2.0
+
+    events = _cluster_anomaly_events(anomaly_points, gap_same, gap_cross)
+    return {
+        "events": events,
+        "anomaly_points": len(anomaly_points),
+        "gap_seconds": round(gap_same, 2),
+    }
 
 
 if __name__ == "__main__":

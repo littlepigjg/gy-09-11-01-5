@@ -90,3 +90,19 @@ button.primary { background: linear-gradient(90deg, #1565c0, #4527a0); border: n
 .meta .hl { color: #4fc3f7; }
 
 .legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+
+/* 异常事件列表 */
+.event-list { display: flex; flex-direction: column; gap: 10px; max-height: 320px; overflow-y: auto; }
+.event-item {
+  background: #1a2333;
+  border: 1px solid #31405e;
+  border-left: 3px solid #ff5252;
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+.event-head { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; flex-wrap: wrap; }
+.event-id { font-weight: 600; color: #ff8a80; font-size: 13px; }
+.event-time { color: #d7dde8; font-size: 13px; font-variant-numeric: tabular-nums; }
+.event-dur { color: #7a869e; font-size: 12px; }
+.event-body { display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; color: #8b96ad; }
+.event-empty { color: #5c6880; font-size: 13px; padding: 12px 0; }

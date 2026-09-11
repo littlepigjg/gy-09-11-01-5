@@ -60,6 +60,26 @@
     </div>
 
     <div class="chart-card">
+      <h3>异常事件 · 按时间接近度与实例关联性自动聚类（{{ anomalyEvents.length }} 个事件 · 聚类间隔: {{ eventGap }}s）</h3>
+      <div v-if="anomalyEvents.length" class="event-list">
+        <div v-for="e in anomalyEvents" :key="e.id" class="event-item">
+          <div class="event-head">
+            <span class="event-id">{{ e.id }}</span>
+            <span class="event-time">{{ fmtTs(e.start_ts) }} ~ {{ fmtTs(e.end_ts) }}</span>
+            <span class="event-dur">持续 {{ fmtDur(e.duration_sec) }}</span>
+          </div>
+          <div class="event-body">
+            <span>指标: {{ e.metrics.join(', ') }}</span>
+            <span>影响范围: {{ e.instances.join(', ') || '-' }}</span>
+            <span>异常点: {{ e.point_count }}</span>
+            <span>峰值 Z: {{ e.max_zscore }}</span>
+          </div>
+        </div>
+      </div>
+      <div v-else class="event-empty">该时间范围内无异常事件</div>
+    </div>
+
+    <div class="chart-card">
       <h3>实时曲线（最近 {{ liveWindow }} 秒原始点）· 异常点以红色标注</h3>
       <div ref="liveChart" class="chart"></div>
       <div class="meta">
@@ -95,6 +115,8 @@ const live = ref(true)
 const liveWindow = 300
 const anomalyThreshold = 3.0
 const anomalyCount = ref(0)
+const anomalyEvents = ref([])
+const eventGap = ref('-')
 
 const queryMeta = reactive({ bucket: '-', source: 'raw', elapsed: '-' })
 
@@ -137,7 +159,7 @@ function toggleLive() { live.value = !live.value; scheduleLive() }
 
 // ---------- 历史查询: 多指标对比 + 降采样 ----------
 async function onQuery() {
-  if (!selected.value.length) { histInst.setOption({ series: [] }); return }
+  if (!selected.value.length) { anomalyEvents.value = []; histInst.setOption({ series: [] }); return }
   const end = Math.floor(Date.now() / 1000)
   const start = end - rangeSec.value
   const q = new URLSearchParams({
@@ -176,7 +198,41 @@ async function onQuery() {
     })
   }
 
+  // 异常事件聚类: 在曲线上以色带标出每次故障的起止区间
+  const events = await fetchEvents(start, end)
+  anomalyEvents.value = events
+  if (events.length && series.length) {
+    series[0].markArea = {
+      silent: true,
+      itemStyle: { color: 'rgba(255, 82, 82, 0.10)' },
+      label: { color: '#ff8a80', fontSize: 10 },
+      data: events.map(e => [{ name: e.id, xAxis: e.start_ts }, { xAxis: e.end_ts }]),
+    }
+  }
+
   histInst.setOption(buildBaseOption(false, series), true)
+}
+
+async function fetchEvents(start, end) {
+  const q = new URLSearchParams({
+    metrics: selected.value.join(','),
+    instance: instance.value,
+    start: String(start), end: String(end),
+    threshold: String(anomalyThreshold),
+  })
+  const data = await fetchJson('/api/anomaly-events?' + q.toString())
+  eventGap.value = data.gap_seconds ?? '-'
+  return data.events || []
+}
+
+function fmtTs(ms) {
+  const d = new Date(ms)
+  return d.toLocaleString('zh-CN', { hour12: false })
+}
+function fmtDur(sec) {
+  if (sec < 60) return `${Math.round(sec)}秒`
+  if (sec < 3600) return `${(sec / 60).toFixed(1)}分钟`
+  return `${(sec / 3600).toFixed(1)}小时`
 }
 
 async function fetchAnomalies(metric, start, end) {
