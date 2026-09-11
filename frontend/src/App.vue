@@ -60,9 +60,18 @@
     </div>
 
     <div class="chart-card">
-      <h3>异常事件 · 按时间接近度与实例关联性自动聚类（{{ anomalyEvents.length }} 个事件 · 聚类间隔: {{ eventGap }}s）</h3>
-      <div v-if="anomalyEvents.length" class="event-list">
-        <div v-for="e in anomalyEvents" :key="e.id" class="event-item">
+      <div class="card-head">
+        <h3>异常事件 · 按时间接近度与实例关联性自动聚类（可见 {{ visibleEvents.length }} / 共 {{ anomalyEvents.length }} 个 · 聚类间隔: {{ eventGap }}s）</h3>
+        <button class="reset-zoom" @click="resetZoom">重置缩放</button>
+      </div>
+      <div v-if="visibleEvents.length" class="event-list">
+        <div
+          v-for="e in visibleEvents"
+          :key="e.id"
+          class="event-item"
+          :class="{ active: activeEventId === e.id }"
+          @click="focusEvent(e)"
+        >
           <div class="event-head">
             <span class="event-id">{{ e.id }}</span>
             <span class="event-time">{{ fmtTs(e.start_ts) }} ~ {{ fmtTs(e.end_ts) }}</span>
@@ -76,7 +85,7 @@
           </div>
         </div>
       </div>
-      <div v-else class="event-empty">该时间范围内无异常事件</div>
+      <div v-else class="event-empty">{{ anomalyEvents.length ? '当前可视范围内无异常事件' : '该时间范围内无异常事件' }}</div>
     </div>
 
     <div class="chart-card">
@@ -91,7 +100,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as echarts from 'echarts'
 
 const API = ''
@@ -117,6 +126,17 @@ const anomalyThreshold = 3.0
 const anomalyCount = ref(0)
 const anomalyEvents = ref([])
 const eventGap = ref('-')
+// 面板 <-> 曲线双向联动状态
+const activeEventId = ref(null)   // 当前选中(点击定位)的事件
+const visStart = ref(0)           // 历史曲线当前可视窗口起点(毫秒)
+const visEnd = ref(0)             // 历史曲线当前可视窗口终点(毫秒)
+let queryStartMs = 0              // 本次历史查询的完整范围(毫秒)
+let queryEndMs = 0
+
+// 曲线可视范围过滤面板: 只列出与可视窗口有交集的事件
+const visibleEvents = computed(() =>
+  anomalyEvents.value.filter(e => e.end_ts >= visStart.value && e.start_ts <= visEnd.value)
+)
 
 const queryMeta = reactive({ bucket: '-', source: 'raw', elapsed: '-' })
 
@@ -162,6 +182,12 @@ async function onQuery() {
   if (!selected.value.length) { anomalyEvents.value = []; histInst.setOption({ series: [] }); return }
   const end = Math.floor(Date.now() / 1000)
   const start = end - rangeSec.value
+  // 记录完整查询范围并重置联动状态(新查询后曲线回到全量视图)
+  queryStartMs = start * 1000
+  queryEndMs = end * 1000
+  visStart.value = queryStartMs
+  visEnd.value = queryEndMs
+  activeEventId.value = null
   const q = new URLSearchParams({
     metrics: selected.value.join(','),
     instance: instance.value,
@@ -233,6 +259,38 @@ function fmtDur(sec) {
   if (sec < 60) return `${Math.round(sec)}秒`
   if (sec < 3600) return `${(sec / 60).toFixed(1)}分钟`
   return `${(sec / 3600).toFixed(1)}小时`
+}
+
+// ---------- 面板 <-> 曲线双向联动 ----------
+// 面板驱动曲线: 点击事件, 历史曲线缩放到该事件时间范围(前后留上下文)
+function focusEvent(e) {
+  activeEventId.value = e.id
+  const pad = Math.max((e.end_ts - e.start_ts) * 0.3, 120_000)
+  histInst.dispatchAction({
+    type: 'dataZoom',
+    startValue: Math.max(e.start_ts - pad, queryStartMs),
+    endValue: Math.min(e.end_ts + pad, queryEndMs),
+  })
+}
+
+function resetZoom() {
+  activeEventId.value = null
+  histInst.dispatchAction({ type: 'dataZoom', startValue: queryStartMs, endValue: queryEndMs })
+}
+
+// 曲线驱动面板: 用户在图上缩放(滑块/滚轮/程序触发)后, 同步当前可视窗口
+function syncVisibleWindow() {
+  const dz = histInst.getOption()?.dataZoom?.[0]
+  if (!dz) return
+  let s = dz.startValue, t = dz.endValue
+  if (s == null || t == null) {
+    // 未显式设置起止值时按百分比换算
+    const span = queryEndMs - queryStartMs
+    s = queryStartMs + ((dz.start ?? 0) / 100) * span
+    t = queryStartMs + ((dz.end ?? 100) / 100) * span
+  }
+  visStart.value = s
+  visEnd.value = t
 }
 
 async function fetchAnomalies(metric, start, end) {
@@ -345,6 +403,8 @@ onMounted(async () => {
   await nextTick()
   histInst = echarts.init(historyChart.value, 'dark')
   liveInst = echarts.init(liveChart.value, 'dark')
+  // 曲线缩放(滑块/滚轮/点击事件定位)时同步可视窗口, 驱动面板过滤
+  histInst.on('datazoom', syncVisibleWindow)
   window.addEventListener('resize', () => { histInst.resize(); liveInst.resize() })
   await loadMetrics()
   await onQuery()
